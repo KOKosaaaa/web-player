@@ -302,7 +302,7 @@ body { background:var(--bg); color:var(--tx); font-family:'Manrope',sans-serif; 
 }
 .wave-area.zoomed { cursor:grab; }
 .wave-inner { position:relative; width:100%; height:100%; }
-.wave-canvas { position:absolute; top:0; left:0; height:100%; display:block; }
+.wave-canvas { display:block; width:100%; height:100%; }
 .dim-left, .dim-right { position:absolute; top:0; bottom:0; background:rgba(0,0,0,.55); pointer-events:none; }
 .dim-left { left:0; }
 .dim-right { right:0; }
@@ -423,7 +423,7 @@ body { background:var(--bg); color:var(--tx); font-family:'Manrope',sans-serif; 
           <button class="ebtn ebtn-sel" onclick="edPlaySel()">&#9654; Выделение</button>
           <button class="ebtn ebtn-sel" onclick="edPlayPreview()">&#9654; Превью</button>
           <button class="ebtn ebtn-stop" onclick="edStop()">&#9632; Стоп</button>
-          <button class="ebtn ebtn-apply" onclick="edApply()">&#10003; Применить</button>
+          <button class="ebtn ebtn-apply" onclick="edApply()">&#10003; Создать нарезку</button>
         </div>
         <div class="editor-hint">Тяните зелёные ручки &#8596; для выделения | Колёсико — зум</div>
       </div>
@@ -491,7 +491,6 @@ document.getElementById('filePicker').addEventListener('change', function() {
     }
     const url = URL.createObjectURL(file);
     const title = file.name.replace(/\.[^.]+$/, '');
-    console.log('[Add]', title, '— тип:', file.type, 'размер:', file.size);
     tracks.push({ id: nextId++, title, src: url, blob: file });
   });
   this.value = '';
@@ -734,10 +733,10 @@ function removeTrack(i) {
   if (currentIdx === i) { currentAudio = null; currentEl = null; currentIdx = null; cancelAnimationFrame(animFrame); }
   else if (currentIdx !== null && currentIdx > i) currentIdx--;
   // Инвалидируем редактор если открыт для этого трека
-  if (eI === i) { eI = null; eB = null; if (eA) { eA.pause(); eA = null; }
+  if (edIdx === i) { edIdx = null; edBuf = null; if (edAudio) { edAudio.pause(); edAudio = null; }
     document.getElementById('editorBody').style.display = 'none';
     document.getElementById('editorEmpty').style.display = 'flex';
-  } else if (eI !== null && eI > i) { eI--; }
+  } else if (edIdx !== null && edIdx > i) { edIdx--; }
   tracks.splice(i, 1);
   render();
   saveToDB();
@@ -757,270 +756,298 @@ function fmtLong(s) {
   return (m < 10 ? '0' : '') + m + ':' + (c < 10 ? '0' : '') + c;
 }
 
-
 // ═══════════════════════════════
-//  EDITOR — скопировано из оригинального пульта
+//  EDITOR
 // ═══════════════════════════════
 let editorOpen = false;
+let edBuf = null, edIdx = null, edAudio = null, edAnimFrame = null;
+let edStart = 0, edEnd = 0, edDuration = 0;
+let zoomLevel = 1, zoomOffset = 0;
+let edPreviewUrl = null; // для отслеживания и освобождения
+
 function toggleEditor() {
   editorOpen = !editorOpen;
   document.getElementById('editorPanel').classList.toggle('open', editorOpen);
   document.getElementById('main').classList.toggle('editor-open', editorOpen);
 }
 
-let eB=null,eI=null,eA=null,eAI=null,eS=0,eE=0,eD=0;
-let zoomLvl=1,zoomOff=0;
+function openEditor(i) {
+  if (!validIdx(i)) return;
+  if (!editorOpen) toggleEditor();
+  document.querySelectorAll('.ibtn-trim').forEach(b => b.classList.remove('active-trim'));
+  const btn = document.querySelector('#t' + i + ' .ibtn-trim');
+  if (btn) btn.classList.add('active-trim');
 
-function openEditor(i){
-  if(!validIdx(i))return;
-  if(!editorOpen)toggleEditor();
-  document.querySelectorAll('.ibtn-trim').forEach(b=>b.classList.remove('active-trim'));
-  const btn=document.querySelector('#t'+i+' .ibtn-trim');if(btn)btn.classList.add('active-trim');
-  document.getElementById('editorEmpty').style.display='none';
-  document.getElementById('editorBody').style.display='flex';
-  const t=tracks[i];document.getElementById('editorLabel').textContent=t.title;
-  eI=i;eS=0;eE=0;eD=0;zoomLvl=1;zoomOff=0;
-  if(eA){eA.pause();eA=null}
-  edOrigSrc=t.src;
-  eA=new Audio(t.src);eA.preload='auto';
-  const ax=new(window.AudioContext||window.webkitAudioContext)();
-  // Всегда декодируем оригинал, чтобы можно было вырезать любой кусок
-  const srcBlob=t.originalBlob||t.blob;
-  const reader=new FileReader();
-  reader.onload=function(){ax.decodeAudioData(reader.result,function(d){
-    eB=d;eD=d.duration;eE=eD;dW(d);ax.close()},function(e){
-    console.error('decodeAudioData error:',e);alert('Не удалось декодировать аудио');ax.close()})};
-  reader.readAsArrayBuffer(srcBlob);
+  document.getElementById('editorEmpty').style.display = 'none';
+  document.getElementById('editorBody').style.display = 'flex';
+  const t = tracks[i];
+  document.getElementById('editorLabel').textContent = t.title; // textContent — безопасно
+
+  edIdx = i; edStart = 0; edEnd = 0; edDuration = 0;
+  zoomLevel = 1; zoomOffset = 0;
+  if (edAudio) { edAudio.pause(); edAudio = null; }
+  safeRevoke(edPreviewUrl); edPreviewUrl = null;
+  edAudio = new Audio(t.src);
+  edAudio.preload = 'auto';
+
+  let ctx;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+  } catch(e) { alert('AudioContext не поддерживается'); return; }
+
+  fetch(t.src)
+    .then(r => r.arrayBuffer())
+    .then(b => ctx.decodeAudioData(b))
+    .then(d => {
+      edBuf = d; edDuration = d.duration; edEnd = edDuration;
+      drawWave(d); updateEditorUI();
+    })
+    .catch(err => {
+      console.error('Ошибка декодирования аудио:', err);
+      alert('Не удалось декодировать аудио. Файл повреждён или формат не поддерживается.');
+    })
+    .finally(() => {
+      try { ctx.close(); } catch(e) {}
+    });
 }
-function dW(b){
-  const waEl=document.getElementById('waveArea');
-  const baseW=waEl.clientWidth,h=waEl.clientHeight;
-  if(baseW<=0||h<=0)return;
-  // Ограничиваем offset чтобы не уехать за пределы трека
-  const maxOff=Math.max(0,1-1/zoomLvl);
-  zoomOff=Math.max(0,Math.min(maxOff,zoomOff));
-  // Inner НЕ растёт — остаётся 100%
-  const cv=document.getElementById('waveCanvas');
-  cv.width=baseW*2;cv.height=h*2;
-  cv.style.width=baseW+'px';cv.style.left='0px';
-  const c=cv.getContext('2d');
-  if(!c)return;
-  c.scale(2,2);
-  // Видимый диапазон трека: [zoomOff .. zoomOff + 1/zoomLvl]
-  const visStart=zoomOff;
-  const visEnd=Math.min(1,zoomOff+1/zoomLvl);
-  const d=b.getChannelData(0),total=d.length;
-  const sStart=Math.floor(visStart*total);
-  const sEnd=Math.min(total,Math.ceil(visEnd*total));
-  const visSamples=sEnd-sStart;
-  const bars=baseW*2;
-  if(bars<=0||visSamples<=0)return;
-  const st=Math.max(1,Math.floor(visSamples/bars)),mid=h/2;
-  c.clearRect(0,0,baseW,h);
-  for(let x=0;x<bars;x++){let mn=0,mx=0;const s=sStart+x*st;
-  for(let j=0;j<st;j+=3){const v=d[s+j]||0;if(v<mn)mn=v;if(v>mx)mx=v}
-  const bh=Math.max(.5,(mx-mn)*mid*.45);const alpha=.3+Math.min(.6,bh/mid*2);
-  c.fillStyle='rgba(108,92,231,'+alpha+')';c.fillRect(x*baseW/bars,mid-bh,Math.max(.5,baseW/bars*.5),bh*2)}
-  document.getElementById('zoomLabel').textContent='x'+zoomLvl.toFixed(1);
-  waEl.classList.toggle('zoomed',zoomLvl>1);
-  uEd();
+
+function drawWave(buf) {
+  const area = document.getElementById('waveArea');
+  const inner = document.getElementById('waveInner');
+  const baseW = area.clientWidth, h = area.clientHeight;
+  if (baseW <= 0 || h <= 0) return; // защита от нулевых размеров
+  const totalW = Math.round(baseW * zoomLevel);
+  inner.style.width = totalW + 'px';
+  const cv = document.getElementById('waveCanvas');
+  cv.style.width = totalW + 'px';
+  cv.width = totalW * 2; cv.height = h * 2;
+  const c = cv.getContext('2d'); c.scale(2, 2);
+  const data = buf.getChannelData(0);
+  const bars = totalW * 2;
+  if (bars <= 0) return;
+  const step = Math.max(1, Math.floor(data.length / bars));
+  const mid = h / 2;
+  c.clearRect(0, 0, totalW, h);
+  for (let x = 0; x < bars; x++) {
+    let mn = 0, mx = 0;
+    const s = x * step;
+    for (let j = 0; j < step; j += 3) { const v = data[s + j] || 0; if (v < mn) mn = v; if (v > mx) mx = v; }
+    const bh = Math.max(.5, (mx - mn) * mid * .45);
+    const alpha = .3 + Math.min(.6, bh / mid * 2);
+    c.fillStyle = 'rgba(108,92,231,' + alpha + ')';
+    c.fillRect(x * totalW / bars, mid - bh, .4, bh * 2);
+  }
+  applyZoomScroll();
 }
-function uEd(){
-  if(eD<=0)return;
-  const waEl=document.getElementById('waveArea');
-  const baseW=waEl.clientWidth;
-  if(baseW<=0)return;
-  // Конвертация: доля трека → пиксель в видимой области
-  function f2px(f){return(f-zoomOff)*zoomLvl*baseW}
-  const leftPx=f2px(eS/eD);
-  const rightPx=f2px(eE/eD);
-  const sel=document.getElementById('rangeSel');
-  sel.style.left=leftPx+'px';sel.style.width=(rightPx-leftPx)+'px';
-  document.getElementById('dimL').style.width=Math.max(0,leftPx)+'px';
-  const dimR=document.getElementById('dimR');
-  dimR.style.left=rightPx+'px';dimR.style.right='auto';dimR.style.width=Math.max(0,baseW-rightPx)+'px';
-  // Playhead тоже в пикселях
-  document.getElementById('wtl').textContent=fmtLong(0);document.getElementById('wtr').textContent=fmtLong(eD);
-  document.getElementById('wbl').textContent=fmtLong(eS);document.getElementById('wbr').textContent=fmtLong(eE);
-  document.getElementById('edStart').textContent=fmtLong(eS);document.getElementById('edEnd').textContent=fmtLong(eE);
-  document.getElementById('edDur').textContent=fmtLong(eE-eS);
+
+function applyZoomScroll() {
+  const area = document.getElementById('waveArea');
+  const inner = document.getElementById('waveInner');
+  const baseW = area.clientWidth, totalW = baseW * zoomLevel;
+  const maxOff = Math.max(0, (totalW - baseW) / totalW);
+  zoomOffset = Math.max(0, Math.min(maxOff, zoomOffset));
+  inner.style.transform = 'translateX(' + (-zoomOffset * totalW) + 'px)';
+  document.getElementById('zoomLabel').textContent = 'x' + zoomLevel.toFixed(1);
+  area.classList.toggle('zoomed', zoomLevel > 1);
 }
-function setupEditorHandles(){
-  const area=document.getElementById('waveArea');
-  area.addEventListener('wheel',e=>{
-    if(!eB)return;e.preventDefault();
-    const rc=area.getBoundingClientRect();
-    const mouseX=e.clientX-rc.left;
-    const baseW=rc.width;
-    const oldZ=zoomLvl;
-    if(e.deltaY<0)zoomLvl=Math.min(40,zoomLvl*1.25);
-    else zoomLvl=Math.max(1,zoomLvl/1.25);
-    const trackFrac=(zoomOff*baseW*oldZ+mouseX)/(baseW*oldZ);
-    zoomOff=(trackFrac*baseW*zoomLvl-mouseX)/(baseW*zoomLvl);
-    dW(eB);
-  },{passive:false});
 
-  let lastTouchDist=0,lastTouchCenter=0;
-  area.addEventListener('touchstart',e=>{
-    if(e.touches.length===2){
-      const dx=e.touches[0].clientX-e.touches[1].clientX;
-      const dy=e.touches[0].clientY-e.touches[1].clientY;
-      lastTouchDist=Math.sqrt(dx*dx+dy*dy);
-      lastTouchCenter=(e.touches[0].clientX+e.touches[1].clientX)/2;
-    }
-  },{passive:true});
-  area.addEventListener('touchmove',e=>{
-    if(e.touches.length===2&&eB){
-      e.preventDefault();
-      const dx=e.touches[0].clientX-e.touches[1].clientX;
-      const dy=e.touches[0].clientY-e.touches[1].clientY;
-      const dist=Math.sqrt(dx*dx+dy*dy);
-      const center=(e.touches[0].clientX+e.touches[1].clientX)/2;
-      const rc=area.getBoundingClientRect();
-      const mouseX=center-rc.left;
-      const baseW=rc.width;
-      const oldZ=zoomLvl;
-      const scale=dist/lastTouchDist;
-      zoomLvl=Math.max(1,Math.min(40,zoomLvl*scale));
-      const trackFrac=(zoomOff*baseW*oldZ+mouseX)/(baseW*oldZ);
-      zoomOff=(trackFrac*baseW*zoomLvl-mouseX)/(baseW*zoomLvl);
-      lastTouchDist=dist;lastTouchCenter=center;
-      dW(eB);
-    }
-  },{passive:false});
+function updateEditorUI() {
+  if (edDuration <= 0) return; // защита от деления на ноль
+  const pL = edStart / edDuration, pR = edEnd / edDuration;
+  document.getElementById('rangeSel').style.left = (pL * 100) + '%';
+  document.getElementById('rangeSel').style.width = ((pR - pL) * 100) + '%';
+  document.getElementById('dimL').style.width = (pL * 100) + '%';
+  document.getElementById('dimR').style.width = ((1 - pR) * 100) + '%';
+  document.getElementById('wtl').textContent = fmtLong(0);
+  document.getElementById('wtr').textContent = fmtLong(edDuration);
+  document.getElementById('wbl').textContent = fmtLong(edStart);
+  document.getElementById('wbr').textContent = fmtLong(edEnd);
+  document.getElementById('edStart').textContent = fmtLong(edStart);
+  document.getElementById('edEnd').textContent = fmtLong(edEnd);
+  document.getElementById('edDur').textContent = fmtLong(edEnd - edStart);
+}
 
-  function mk(h,side){
-    function st(e){e.preventDefault();e.stopPropagation();
-      const move=ev=>{ev.preventDefault();
-        const rc=area.getBoundingClientRect();const cx=ev.touches?ev.touches[0].clientX:ev.clientX;
-        const baseW=rc.width;
-        const frac=(zoomOff*baseW*zoomLvl+(cx-rc.left))/(baseW*zoomLvl);
-        let t=Math.max(0,Math.min(eD,frac*eD));
-        if(side==='l'){eS=Math.max(0,Math.min(t,eE-.05))}else{eE=Math.min(eD,Math.max(t,eS+.05))}uEd()};
-      const up=()=>{document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up);document.removeEventListener('touchmove',move);document.removeEventListener('touchend',up)};
-      document.addEventListener('mousemove',move);document.addEventListener('mouseup',up);document.addEventListener('touchmove',move,{passive:false});document.addEventListener('touchend',up)}
-    h.addEventListener('mousedown',st);h.addEventListener('touchstart',st,{passive:false})}
-  mk(document.getElementById('handleL'),'l');mk(document.getElementById('handleR'),'r');
+function editorReset() {
+  if (!edBuf) return;
+  edStart = 0; edEnd = edDuration; zoomLevel = 1; zoomOffset = 0;
+  drawWave(edBuf); updateEditorUI();
+}
 
-  let panStart=null,panStartOff=0,panMoved=false;
-  area.addEventListener('mousedown',e=>{
-    if(!eB||e.target.closest('.handle-l,.handle-r')||zoomLvl<=1)return;
-    panStart=e.clientX;panStartOff=zoomOff;panMoved=false;
-    area.style.cursor='grabbing';
-    const mv=ev=>{
-      const dx=ev.clientX-panStart;
-      if(Math.abs(dx)>3)panMoved=true;
-      const baseW=area.getBoundingClientRect().width;
-      zoomOff=panStartOff-dx/(baseW*zoomLvl);
-      dW(eB);
+// Zoom via wheel
+document.getElementById('waveArea').addEventListener('wheel', function(e) {
+  if (!edBuf) return;
+  e.preventDefault();
+  const area = this;
+  const rect = area.getBoundingClientRect();
+  const mouseX = e.clientX - rect.left;
+  const baseW = rect.width;
+  const oldZ = zoomLevel;
+  const scale = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  zoomLevel = Math.max(1, Math.min(40, zoomLevel * scale));
+  const frac = (zoomOffset * baseW * oldZ + mouseX) / (baseW * oldZ);
+  zoomOffset = (frac * baseW * zoomLevel - mouseX) / (baseW * zoomLevel);
+  drawWave(edBuf); updateEditorUI();
+}, { passive: false });
+
+// Pinch zoom for touch
+let lastTouchDist = null;
+document.getElementById('waveArea').addEventListener('touchstart', e => { if (e.touches.length === 2) { lastTouchDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); } }, { passive: true });
+document.getElementById('waveArea').addEventListener('touchmove', function(e) {
+  if (e.touches.length === 2 && edBuf && lastTouchDist) {
+    e.preventDefault();
+    const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+    const center = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    const rect = this.getBoundingClientRect();
+    const mouseX = center - rect.left;
+    const baseW = rect.width;
+    const oldZ = zoomLevel;
+    const scale = dist / lastTouchDist;
+    zoomLevel = Math.max(1, Math.min(40, zoomLevel * scale));
+    const frac = (zoomOffset * baseW * oldZ + mouseX) / (baseW * oldZ);
+    zoomOffset = (frac * baseW * zoomLevel - mouseX) / (baseW * zoomLevel);
+    lastTouchDist = dist;
+    drawWave(edBuf); updateEditorUI();
+  }
+}, { passive: false });
+
+// Handle dragging
+function makeHandle(handle, side) {
+  function start(e) {
+    e.preventDefault(); e.stopPropagation();
+    const area = document.getElementById('waveArea');
+    const move = ev => {
+      ev.preventDefault();
+      const rc = area.getBoundingClientRect();
+      const cx = ev.touches ? ev.touches[0].clientX : ev.clientX;
+      const baseW = rc.width;
+      const frac = (zoomOffset * baseW * zoomLevel + (cx - rc.left)) / (baseW * zoomLevel);
+      let t = Math.max(0, Math.min(edDuration, frac * edDuration));
+      if (side === 'l') edStart = Math.max(0, Math.min(t, edEnd - .05));
+      else edEnd = Math.min(edDuration, Math.max(t, edStart + .05));
+      updateEditorUI();
     };
-    const up=()=>{area.style.cursor='crosshair';document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);panStart=null};
-    document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);
-  });
-  area.addEventListener('click',e=>{
-    if(!eB||e.target.closest('.handle-l,.handle-r')||panMoved)return;
-    const rc=area.getBoundingClientRect();const baseW=rc.width;
-    const frac=(zoomOff*baseW*zoomLvl+(e.clientX-rc.left))/(baseW*zoomLvl);
-    if(eA)eA.currentTime=Math.max(0,Math.min(eD,frac*eD))});
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); document.removeEventListener('touchmove', move); document.removeEventListener('touchend', up); };
+    document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+    document.addEventListener('touchmove', move, { passive: false }); document.addEventListener('touchend', up);
+  }
+  handle.addEventListener('mousedown', start);
+  handle.addEventListener('touchstart', start, { passive: false });
+}
+makeHandle(document.getElementById('handleL'), 'l');
+makeHandle(document.getElementById('handleR'), 'r');
 
-  let touchPanId=null,touchPanX=0,touchPanOff=0,touchPanMoved=false;
-  area.addEventListener('touchstart',e=>{
-    if(!eB||e.touches.length===1&&!e.target.closest('.handle-l,.handle-r')&&zoomLvl>1){
-      touchPanId=e.touches[0].identifier;touchPanX=e.touches[0].clientX;touchPanOff=zoomOff;touchPanMoved=false;
+// Click to seek in editor
+let panStart = null, panStartOff = 0, panMoved = false;
+const waveArea = document.getElementById('waveArea');
+waveArea.addEventListener('mousedown', e => {
+  if (!edBuf || e.target.closest('.handle-l,.handle-r') || zoomLevel <= 1) return;
+  panStart = e.clientX; panStartOff = zoomOffset; panMoved = false;
+  waveArea.style.cursor = 'grabbing';
+  const mv = ev => { const dx = ev.clientX - panStart; if (Math.abs(dx) > 3) panMoved = true; const bw = waveArea.getBoundingClientRect().width; zoomOffset = panStartOff - dx / (bw * zoomLevel); applyZoomScroll(); updateEditorUI(); };
+  const up = () => { waveArea.style.cursor = 'crosshair'; document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); panStart = null; };
+  document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+});
+waveArea.addEventListener('click', e => {
+  if (!edBuf || e.target.closest('.handle-l,.handle-r') || panMoved) return;
+  const rc = waveArea.getBoundingClientRect(); const bw = rc.width;
+  const frac = (zoomOffset * bw * zoomLevel + (e.clientX - rc.left)) / (bw * zoomLevel);
+  if (edAudio) edAudio.currentTime = Math.max(0, Math.min(edDuration, frac * edDuration));
+});
+
+// Editor playback
+function edAnimateLoop(stopAt) {
+  const ph = document.getElementById('playhead'); ph.style.display = 'block';
+  cancelAnimationFrame(edAnimFrame);
+  if (!edAudio || edDuration <= 0) return;
+  (function s() {
+    if (!edAudio || edAudio.paused || edAudio.ended || (stopAt && edAudio.currentTime >= stopAt)) {
+      if (edAudio) edAudio.pause();
+      ph.style.display = 'none'; return;
     }
-  },{passive:true});
-  area.addEventListener('touchmove',e=>{
-    if(e.touches.length===1&&touchPanId!==null&&zoomLvl>1){
-      const t=Array.from(e.touches).find(t=>t.identifier===touchPanId);
-      if(!t)return;
-      const dx=t.clientX-touchPanX;
-      if(Math.abs(dx)>3){touchPanMoved=true;e.preventDefault()}
-      const baseW=area.getBoundingClientRect().width;
-      zoomOff=touchPanOff-dx/(baseW*zoomLvl);
-      dW(eB);
-    }
-  },{passive:false});
-  area.addEventListener('touchend',()=>{touchPanId=null});
+    ph.style.left = (Math.max(0, Math.min(100, edAudio.currentTime / edDuration * 100))) + '%';
+    edAnimFrame = requestAnimationFrame(s);
+  })();
+}
+function edPlayAll() { if (!edAudio) return; edAudio.currentTime = 0; edAudio.play().catch(e => console.warn('EdPlay error:', e)); edAnimateLoop(null); }
+function edPlaySel() { if (!edAudio || edEnd <= edStart) return; edAudio.currentTime = edStart; edAudio.play().catch(e => console.warn('EdPlaySel error:', e)); edAnimateLoop(edEnd); }
+function edStop() { if (edAudio) { edAudio.pause(); edAudio.currentTime = 0; } document.getElementById('playhead').style.display = 'none'; cancelAnimationFrame(edAnimFrame); }
+
+function edPlayPreview() {
+  if (!edBuf || edEnd <= edStart || edDuration <= 0) return;
+  const sr = edBuf.sampleRate, ch = edBuf.numberOfChannels;
+  const s0 = Math.floor(edStart * sr), s1 = Math.floor(edEnd * sr), ln = s1 - s0;
+  if (ln <= 0) return;
+  let ofx;
+  try { ofx = new OfflineAudioContext(ch, ln, sr); } catch(e) { return; }
+  const nb = ofx.createBuffer(ch, ln, sr);
+  for (let c = 0; c < ch; c++) { const s = edBuf.getChannelData(c), d = nb.getChannelData(c); for (let j = 0; j < ln; j++) d[j] = s[s0 + j]; }
+  const src = ofx.createBufferSource(); src.buffer = nb; src.connect(ofx.destination); src.start();
+  ofx.startRendering().then(rendered => {
+    const wav = toWav(rendered), bl = new Blob([wav], { type: 'audio/wav' });
+    // Освобождаем предыдущий превью URL
+    safeRevoke(edPreviewUrl);
+    edPreviewUrl = URL.createObjectURL(bl);
+    if (edAudio) edAudio.pause();
+    edAudio = new Audio(edPreviewUrl); edAudio.play().catch(e => console.warn('Preview play error:', e));
+    const ph = document.getElementById('playhead'); ph.style.display = 'block';
+    cancelAnimationFrame(edAnimFrame);
+    const selDur = edEnd - edStart;
+    if (selDur <= 0) return;
+    (function s() {
+      if (edAudio.paused || edAudio.ended) { ph.style.display = 'none'; return; }
+      const pct = edStart / edDuration + (edAudio.currentTime / selDur) * ((edEnd - edStart) / edDuration);
+      ph.style.left = (Math.max(0, Math.min(100, pct * 100))) + '%';
+      edAnimFrame = requestAnimationFrame(s);
+    })();
+  }).catch(err => console.error('Preview render error:', err));
 }
 
-function editorReset(){if(!eB)return;eS=0;eE=eD;zoomLvl=1;zoomOff=0;dW(eB)}
-
-function edAnimateLoop(stopAt){
-  const p=document.getElementById('playhead');p.style.display='block';cancelAnimationFrame(eAI);
-  (function s(){if(!eA||eA.paused||eA.ended||(stopAt&&eA.currentTime>=stopAt)){if(eA)eA.pause();p.style.display='none';return}
-  var bw=document.getElementById('waveArea').clientWidth;
-  p.style.left=((eA.currentTime/eD-zoomOff)*zoomLvl*bw)+'px';eAI=requestAnimationFrame(s)})();
-}
-let edOrigSrc=null; // оригинальный src трека для восстановления после превью
-function edPlayAll(){
-  if(!eB||eI===null)return;
-  // Восстановить оригинальный аудио если было превью
-  if(edOrigSrc){eA=new Audio(edOrigSrc);eA.preload='auto'}
-  if(!eA)return;
-  eA.currentTime=0;eA.play();edAnimateLoop(null);
-}
-function edPlaySel(){
-  if(!eB||eE<=eS||eI===null)return;
-  if(edOrigSrc){eA=new Audio(edOrigSrc);eA.preload='auto'}
-  if(!eA)return;
-  eA.currentTime=eS;eA.play();edAnimateLoop(eE);
-}
-function edStop(){if(eA){eA.pause();eA.currentTime=0}document.getElementById('playhead').style.display='none';cancelAnimationFrame(eAI)}
-
-let previewUrl=null;
-function edPlayPreview(){
-  if(!eB||eE<=eS)return;
-  const sr=eB.sampleRate,ch=eB.numberOfChannels,s0=Math.floor(eS*sr),s1=Math.floor(eE*sr),ln=s1-s0;
-  if(ln<=0)return;
-  const ofx=new OfflineAudioContext(ch,ln,sr),nb=ofx.createBuffer(ch,ln,sr);
-  for(let c=0;c<ch;c++){const s=eB.getChannelData(c),d=nb.getChannelData(c);for(let j=0;j<ln;j++)d[j]=s[s0+j]}
-  const src2=ofx.createBufferSource();src2.buffer=nb;src2.connect(ofx.destination);src2.start();
-  ofx.startRendering().then(rendered=>{
-    const wav=toWav(rendered),bl=new Blob([wav],{type:'audio/wav'});
-    if(previewUrl)URL.revokeObjectURL(previewUrl);
-    previewUrl=URL.createObjectURL(bl);
-    if(eA)eA.pause();
-    eA=new Audio(previewUrl);eA.play();
-    const p=document.getElementById('playhead');p.style.display='block';cancelAnimationFrame(eAI);
-    const selDur=eE-eS;
-    if(selDur<=0)return;
-    (function s(){if(!eA||eA.paused||eA.ended){p.style.display='none';return}
-    const pct=eS/eD+(eA.currentTime/selDur)*((eE-eS)/eD);
-    var bw2=document.getElementById('waveArea').clientWidth;
-    p.style.left=((pct-zoomOff)*zoomLvl*bw2)+'px';eAI=requestAnimationFrame(s)})();
+function edApply() {
+  if (!edBuf || edEnd <= edStart || edDuration <= 0) { alert('Выделите область'); return; }
+  if (edIdx === null || !validIdx(edIdx)) { alert('Трек не найден'); return; }
+  const sr = edBuf.sampleRate, ch = edBuf.numberOfChannels;
+  const s0 = Math.floor(edStart * sr), s1 = Math.floor(edEnd * sr), ln = s1 - s0;
+  if (ln <= 0) { alert('Слишком короткий фрагмент'); return; }
+  let ofx;
+  try { ofx = new OfflineAudioContext(ch, ln, sr); } catch(e) { alert('Ошибка AudioContext'); return; }
+  const nb = ofx.createBuffer(ch, ln, sr);
+  for (let c = 0; c < ch; c++) { const s = edBuf.getChannelData(c), d = nb.getChannelData(c); for (let j = 0; j < ln; j++) d[j] = s[s0 + j]; }
+  const src = ofx.createBufferSource(); src.buffer = nb; src.connect(ofx.destination); src.start();
+  ofx.startRendering().then(r => {
+    const wav = toWav(r), bl = new Blob([wav], { type: 'audio/wav' });
+    const origTitle = tracks[edIdx].title;
+    const newTitle = origTitle + ' (' + fmtLong(edStart) + '–' + fmtLong(edEnd) + ')';
+    const newUrl = URL.createObjectURL(bl);
+    const newTrack = { id: nextId++, title: newTitle, src: newUrl, blob: bl };
+    // Вставляем новый трек сразу после оригинала
+    tracks.splice(edIdx + 1, 0, newTrack);
+    // Корректируем currentIdx если он сдвинулся
+    if (currentIdx !== null && currentIdx > edIdx) currentIdx++;
+    render();
+    saveToDB();
+    alert('Создан новый трек «' + esc(newTitle) + '»');
+  }).catch(err => {
+    console.error('Trim render error:', err);
+    alert('Ошибка при нарезке');
   });
 }
 
-let applyLock=false;
-function edApply(){
-  if(applyLock)return;
-  if(!eB||eE<=eS){alert('Выделите область');return}
-  if(eI===null||!validIdx(eI)){alert('Трек не найден');return}
-  applyLock=true;
-  const sr=eB.sampleRate,ch=eB.numberOfChannels,s0=Math.floor(eS*sr),s1=Math.floor(eE*sr),ln=s1-s0;
-  if(ln<=0){applyLock=false;return}
-  const of2=new OfflineAudioContext(ch,ln,sr),nb=of2.createBuffer(ch,ln,sr);
-  for(let c=0;c<ch;c++){const s=eB.getChannelData(c),d=nb.getChannelData(c);for(let j=0;j<ln;j++)d[j]=s[s0+j]}
-  const src=of2.createBufferSource();src.buffer=nb;src.connect(of2.destination);src.start();
-  of2.startRendering().then(r=>{
-    const w=toWav(r),bl=new Blob([w],{type:'audio/wav'}),u=URL.createObjectURL(bl);
-    const t=tracks[eI];
-    // Сохраняем оригинал (только первый раз)
-    if(!t.originalBlob)t.originalBlob=t.blob;
-    // Заменяем воспроизведение на обрезку
-    safeRevoke(t.src);
-    t.src=u;t.blob=bl;
-    if(audioCache[t.id]){audioCache[t.id].pause();delete audioCache[t.id]}
-    getAudio(eI);
-    var tmEl=document.getElementById('tm'+eI);if(tmEl)tmEl.textContent='--:--';
-    render();saveToDB();
-    applyLock=false;
-    alert('Трек заменён на фрагмент '+fmtLong(eS)+' \u2013 '+fmtLong(eE)+'\nОригинал сохранён — можно вырезать другой кусок');
-  }).catch(function(){applyLock=false});
+function toWav(buf) {
+  const ch = buf.numberOfChannels, sr = buf.sampleRate, ln = buf.length;
+  const out = new ArrayBuffer(44 + ln * ch * 2), v = new DataView(out);
+  function w(p, s) { for (let i = 0; i < s.length; i++) v.setUint8(p + i, s.charCodeAt(i)); }
+  w(0, 'RIFF'); v.setUint32(4, 36 + ln * ch * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, ch, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * ch * 2, true);
+  v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, ln * ch * 2, true);
+  let off = 44;
+  for (let i = 0; i < ln; i++) for (let c = 0; c < ch; c++) {
+    let x = Math.max(-1, Math.min(1, buf.getChannelData(c)[i]));
+    v.setInt16(off, x < 0 ? x * 0x8000 : x * 0x7FFF, true); off += 2;
+  }
+  return out;
 }
-
-function toWav(b){const ch=b.numberOfChannels,sr=b.sampleRate,ln=b.length,o=new ArrayBuffer(44+ln*ch*2),v=new DataView(o);function w(p,s){for(let i=0;i<s.length;i++)v.setUint8(p+i,s.charCodeAt(i))}w(0,'RIFF');v.setUint32(4,36+ln*ch*2,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,ch,true);v.setUint32(24,sr,true);v.setUint32(28,sr*ch*2,true);v.setUint16(32,ch*2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,ln*ch*2,true);let of3=44;for(let i=0;i<ln;i++)for(let c=0;c<ch;c++){let x=Math.max(-1,Math.min(1,b.getChannelData(c)[i]));v.setInt16(of3,x<0?x*0x8000:x*0x7FFF,true);of3+=2}return o}
-
 
 // ═══════════════════════════════
 //  IndexedDB persistence
@@ -1039,7 +1066,7 @@ function saveToDB() {
     const tx = db.transaction('tracks', 'readwrite');
     const store = tx.objectStore('tracks');
     store.clear();
-    const saveData = tracks.map(t => ({ id: t.id, title: t.title, blob: t.blob, originalBlob: t.originalBlob||null, mime: t.blob && t.blob.type ? t.blob.type : 'audio/mpeg' }));
+    const saveData = tracks.map(t => ({ id: t.id, title: t.title, blob: t.blob }));
     store.put(saveData, 'playlist');
     tx.oncomplete = () => db.close();
     tx.onerror = () => { console.warn('IDB save error:', tx.error); db.close(); };
@@ -1057,16 +1084,8 @@ function loadFromDB() {
         // Валидация загруженных данных
         if (!item || !item.blob || typeof item.title !== 'string') return;
         try {
-          let blob = item.blob;
-          // Восстанавливаем MIME-тип если потерялся при хранении в IDB
-          if (!blob.type && item.mime) {
-            blob = new Blob([blob], { type: item.mime });
-          }
-          console.log('[IDB Load]', item.title, '— blob:', blob.constructor.name, blob.size, 'байт, тип:', blob.type);
-          const url = URL.createObjectURL(blob);
-          const track = { id: nextId++, title: item.title, src: url, blob: blob };
-          if(item.originalBlob)track.originalBlob=item.originalBlob;
-          tracks.push(track);
+          const url = URL.createObjectURL(item.blob);
+          tracks.push({ id: nextId++, title: item.title, src: url, blob: item.blob });
         } catch(e) { console.warn('Ошибка восстановления трека:', item.title, e); }
       });
       render();
@@ -1079,7 +1098,6 @@ function loadFromDB() {
 //  INIT
 // ═══════════════════════════════
 loadFromDB();
-setupEditorHandles();
 </script>
 </body>
 </html>
